@@ -1,0 +1,573 @@
+!==============================================================================!
+!                               ISODNSDATA                                     !
+!                            ----------------                                  !
+!                                                                              !
+!     Direct Numerical Simulation of Homogeneous Isotropic Turbulence          !
+!                                                                              !
+!           ** Data and primitive subroutines definitions **                   ! 
+!                                                                              !
+!  Program features:                                                           !
+! -------------------                                                          !
+!                                                                              !
+!    - Efficient velocity-vorticity formulation                                !
+!                                                                              !
+!    - Optional solenoidal volume force                                        !
+!                                                                              !
+!    - SMP (Simmetric  Multi-Processing) parallel implementation               !
+!                                                                              !
+!    - Low storage mixed RK3/4 - CN ode schemes                                !
+!                                                                              !
+!------------------------------------------------------------------------------!
+!                                                                              !
+! Ref. for the forcing scheme:                                                 !
+!     A. G. Lamorgese, D. A. Caughey, S. B. Pope. "Direct numerical            !
+!     simulation of homogeneous turbulence with hyperviscosity",               !
+!     Physics of Fluids 17, 015106, 2005.                                      !         
+!                                                                              !
+! Ref. for the ode schemes:                                                    !
+!    "Spectral Methods - Fundamentals in single domains",                      !
+!    C. Canuto, M. Y. Hussaini, A. Quarteroni, T.A. Zang,                      !
+!    Springer, 2006.                                                           !
+!                                                                              !
+! Ref. for the assignement of the initial velocity field: 		       !
+!    "Numerical experiments in Homogeneous turbulence",                        !
+!    R. Rogallo, NASA TM-81315, 1981                                           !
+!                                                                              !
+!------------------------------------------------------------------------------!
+!                                                                              !
+! Author      : M. Carini (DIA-PoliMI)                                         !
+! Date        : April 2009                                                     !
+! CPL version : October 2009                                                   ! 
+!                                                                              !
+!==============================================================================!
+
+USE fft
+USE rbmat
+USE parallel
+USE isotypedef
+
+!------------------------------------------------------------------------------!
+!------------------------ Macros' definitions ---------------------------------!
+
+#define parallel_spectra	! macro for smp version of buildspectra
+!#define volume_force           ! macro for turn on volume force
+#define runtime_stat		! macro for statistics runtime calculation 
+!#define unforced		! macro for turn off the forcing scheme
+!#define inviscid               ! macro for turn off viscous dissipation
+!#define visualization          ! macro for visualization setup 
+
+!------------------------------------------------------------------------------!
+!------------------------ Parameters setup ------------------------------------!
+
+nsmp=8 ! Number of shared memory processes
+
+BOOLEAN     restart, restart_corr, restart_stat
+STRING      sol_old, rhs_old, corr_old, corrlog_old, isosavepath
+INTEGER     N, M, memlevels, kmax, kd, kf, Nms=0, ns=0
+INTEGER     save_count, cfl_count, nsteps_cfl, nsteps_save, nsteps, i0
+REAL        ni=0, dt=0, t0=0, P=0, Kine=0, Ense=0, CFL=0, Kinef=0 
+
+#ifdef runtime_stat
+INTEGER     Nm=0
+REAL        Kinem=0, Ense=0, Ensem=0
+STRING      kineps_old, spectra_old
+#endif
+
+FILE dnsdata = OPEN('input/isodnsdata.in')
+READ BY NAME FROM dnsdata N, kf, kd, P; CLOSE dnsdata
+
+#ifndef visualization
+M = 3*(2*N+1) DIV 2; DO INC M UNTIL FFTfit(M)
+#else
+ FILE vtkdata = OPEN('input/isovtk.in')
+ READ BY NAME FROM vtkdata M
+ CLOSE vtkdata 
+#endif
+
+#ifndef inviscid
+ ni = (P/kd**4)**(1/3);
+#endif
+kmax = ROUND(SQRT(3)*N)
+
+memlevels = 1 ! Number of memory levels required by the ode scheme
+
+!------------------------------------------------------------------------------!
+!------------- Data structures definition and allocation ----------------------!
+
+SHARED ARRAY(1..memlevels,0..N,-N..N,-N..N)        OF T_RHS       RHS=0
+SHARED ARRAY(0..N,-N..N,-N..N)                     OF T_VEL_VORT  VV=0
+SHARED ARRAY(0..(M DIV 2)-1,0..M-1,0..M-1)         OF T_FLUX      F=0
+
+#ifdef volume_force
+ SHARED ARRAY(0..N,-N..N,-N..N)                     OF T_B         BB=0
+#endif
+
+#ifdef parallel_spectra
+ SHARED ARRAY(1..kmax,1..nsmp)                      OF REAL        Es=0
+ SHARED ARRAY(1..kmax,1..nsmp)                      OF INTEGER     Mms=0
+ SHARED ARRAY(1..nsmp)                              OF REAL        Kines=0
+ SHARED ARRAY(1..nsmp)                              OF REAL        Enses=0
+#endif
+
+ARRAY(1..6)                                        OF REAL        Ac=0,Bc=0,Cc=0 
+ARRAY(1..kmax)                                     OF REAL        E=0
+
+#ifdef runtime_stat
+ARRAY(1..kmax)                                     OF REAL        Em=0
+#endif
+
+ARRAY(1..kmax)                                     OF INTEGER     Mm=0
+
+FILE kineps, spectra
+
+!------------------------------------------------------------------------------!
+!--------------------- Simmetric Multi-Processing -----------------------------!
+
+INTEGER ismp
+
+!------------------------------------------------------------------------------!
+!------- Index shift function from user definied to CPL fft format ------------! 
+
+INTEGER FUNCTION imdis(INTEGER i) ! -M/2..(M/2)-1 TO 0..M-1
+ IF i < 0 THEN RESULT = i + M ELSE RESULT = i 
+END imdis
+
+!------------------------------------------------------------------------------!
+!-------------------- Initial field generation --------------------------------!
+
+REAL FUNCTION E0Pope(REAL k) 
+ IF k<=kf THEN RESULT=(k/kf)**2 ELSE RESULT=(k/kf)**(-5/3) 
+ RESULT=~*(9/11)*(1/kf) 
+END E0Pope
+
+SUBROUTINE initRogallo(REAL FUNCTION(REAL k) Einitshape) 
+  REAL k,kp,e,psi,theta1,theta2
+  DO WITH VV(ix,iy,iz): 
+   psi=2*PI*RAND(); theta1=2*PI*RAND(); theta2=2*PI*RAND()
+   k=SQRT(ix**2 +iy**2 +iz**2);kp=SQRT(ix**2 +iz**2)
+   e=SQRT(Einitshape(k)/(2*PI*(k**2)))
+   v=-e*(kp/k)*SIN(psi)*EXP(I*theta2); eta=e*I*kp*COS(psi)*EXP(I*theta1)
+  FOR ALL ix, iy, iz EXCEPT ix=0
+  LOOP FOR iy = 0 TO N AND iz = 0 TO N EXCEPT iy=0 AND iz=0
+   psi=2*PI*RAND(); theta1=2*PI*RAND(); theta2=2*PI*RAND()
+   kp=iz;k=SQRT(iy**2 + iz**2);e=SQRT(Einitshape(k)/(2*PI*(k**2)))
+   VV(0,iy,iz).v = -e*(kp/k)*SIN(psi)*EXP(I*theta1)
+   VV(0,iy,iz).eta = e*I*kp*COS(psi)*EXP(I*theta2)
+   VV(0,-iy,-iz).v = CONJG(VV(0,iy,iz).v)
+   VV(0,-iy,-iz).eta = CONJG(VV(0,iy,iz).eta) 
+   psi=2*PI*RAND(); theta1=2*PI*RAND(); theta2=2*PI*RAND()
+   VV(0,-iy,iz).v = -e*(kp/k)*SIN(psi)*EXP(I*theta1)
+   VV(0,-iy,iz).eta = e*I*kp*COS(psi)*EXP(I*theta2)
+   VV(0,iy,-iz).v = CONJG(VV(0, -iy, iz).v)
+   VV(0,iy,-iz).eta = CONJG(VV(0, -iy, iz).eta)
+  REPEAT
+END initRogallo
+
+!------------------------------------------------------------------------------!
+!----------- Pseudo-spectral calculations of non-linear terms -----------------!
+
+SUBROUTINE convolutions()
+ PARALLEL LOOP FOR ismp=0 TO nsmp-1 
+  DO WITH F(ix,iy,*): 
+   IFT(uu); IFT(vv); IFT(ww) 
+  FOR iy = ismp TO M-1 BY nsmp AND ALL ix
+  ! syncronize parallel processes --------
+   SYNC(ismp,nsmp) 
+  !---------------------------------------
+  DO WITH F(ix,*,iz): 
+   IFT(uu); IFT(vv); IFT(ww) 
+  FOR iz = ismp TO M-1 BY nsmp AND ALL ix
+  ! syncronize parallel processes --------
+   SYNC(ismp,nsmp) 
+  !---------------------------------------
+  DO 
+    WITH F(*,iy,iz): RFT(uu); RFT(vv); RFT(ww)  
+    DO WITH F(ix, iy, iz):
+     uv.REAL = uu.REAL*vv.REAL; uv.IMAG = uu.IMAG*vv.IMAG
+     uw.REAL = uu.REAL*ww.REAL; uw.IMAG = uu.IMAG*ww.IMAG
+     vw.REAL = vv.REAL*ww.REAL; vw.IMAG = vv.IMAG*ww.IMAG
+     uu.REAL = uu.REAL*uu.REAL; uu.IMAG = uu.IMAG*uu.IMAG
+     vv.REAL = vv.REAL*vv.REAL; vv.IMAG = vv.IMAG*vv.IMAG
+     ww.REAL = ww.REAL*ww.REAL; ww.IMAG = ww.IMAG*ww.IMAG
+    FOR ALL ix
+    WITH F(*,iy,iz): HFT(uu); HFT(vv); HFT(ww); HFT(uv); HFT(uw); HFT(vw)
+  FOR iz = ismp TO M-1 BY nsmp AND ALL iy
+  ! syncronize parallel processes --------
+   SYNC(ismp,nsmp) 
+  !---------------------------------------
+  DO WITH F(ix,*,iz): 
+   FFT(uu); FFT(vv); FFT(ww); FFT(uv); FFT(uw); FFT(vw) 
+  FOR iz = ismp TO M-1 BY nsmp AND ALL ix
+  ! syncronize parallel processes --------
+   SYNC(ismp,nsmp) 
+  !---------------------------------------
+  DO WITH F(ix,iy,*): 
+   FFT(uu); FFT(vv); FFT(ww); FFT(uv); FFT(uw); FFT(vw) 
+  FOR iy = ismp TO M-1 BY nsmp AND ALL ix
+ REPEAT
+END convolutions
+
+!------------------------------------------------------------------------------!
+!-------- Transformation from v-eta to u-v-w fourier coefficients -------------!
+
+! NOTE: velocity components u,v,w stored in uu, vv, ww respectively
+
+SUBROUTINE buildvelocity()  
+ REAL k2p; F=0
+ PARALLEL LOOP FOR ismp=0 TO nsmp-1
+  LOOP FOR ix = ismp TO N BY nsmp AND iz=-N TO N EXCEPT ix=0 AND iz=0 
+   k2p = ix*ix + iz*iz;
+   DO WITH VV(ix,iy,iz), F(imdis(ix),imdis(iy),imdis(iz)):                              
+    vv = v; uu = -(I*iz*eta +ix*iy*v)/k2p; ww = (I*ix*eta -iz*iy*v)/k2p
+   FOR iy= -N TO N
+  REPEAT  
+  DO WITH VV(0,iy,0), F(0,imdis(iy),0): 
+   uu = eta; ww = v 
+  FOR iy = -N + ismp TO N BY nsmp
+ REPEAT
+END buildvelocity
+
+!------------------------------------------------------------------------------!
+!------------------------- CFL calculation ------------------------------------!
+
+SUBROUTINE getcfl()
+ REAL urmax=0, uimax=0, vrmax=0, vimax=0, wrmax=0, wimax=0
+ buildvelocity
+ PARALLEL LOOP FOR ismp=0 TO nsmp-1 
+  DO WITH F(ix,iy,*): 
+   IFT(uu); IFT(vv); IFT(ww)
+  FOR iy = ismp TO M-1 BY nsmp AND ALL ix
+  ! syncronize parallel processes --------
+   SYNC(ismp,nsmp) 
+  !---------------------------------------
+  DO WITH F(ix,*,iz): 
+   IFT(uu); IFT(vv); IFT(ww) 
+  FOR iz = ismp TO M-1 BY nsmp AND ALL ix
+  ! syncronize parallel processes --------
+   SYNC(ismp,nsmp) 
+  !---------------------------------------
+  DO WITH F(*,iy,iz): 
+   RFT(uu); RFT(vv); RFT(ww) 
+  FOR iz = ismp TO M-1 BY nsmp AND ALL iy
+ REPEAT  
+ urmax = MAXABS(F(*,*,*).uu.REAL); uimax = MAXABS(F(*,*,*).uu.IMAG)  
+ vrmax = MAXABS(F(*,*,*).vv.REAL); vimax = MAXABS(F(*,*,*).vv.IMAG)
+ wrmax = MAXABS(F(*,*,*).ww.REAL); wimax = MAXABS(F(*,*,*).ww.IMAG)
+ CFL = MAX(urmax,uimax,vrmax,vimax,wrmax,wimax)*dt/(2*PI/M)
+END getcfl
+
+!------------------------------------------------------------------------------!
+!---------------------- First order statistics --------------------------------!
+
+! NOTE: Kinef denote the kinetic energy hold inside the forcing shell, used
+!       to define the amplitude of the forcing scheme
+
+#ifdef parallel_spectra
+
+ SUBROUTINE buildspectra()
+  INTEGER ii, k2p; REAL k, Ek; 
+  Mms=0; Es=0; Kines=0; Enses=0
+  Mm=0; E=0; Kine=0; Ense=0
+  PARALLEL LOOP FOR ismp=0 TO nsmp-1
+   DO WITH VV(ix,iy,iz):
+    k2p = ix*ix + iz*iz; k = SQRT(ix*ix + iy*iy + iz*iz); ii = ROUND(k); Ek=0;
+    IF k2p > 0 THEN 
+     Ek = 0.5*(IF ix= 0 THEN 1 ELSE 2)*((k*k)*NORM(v)+NORM(eta))/k2p
+    ELSE
+     Ek = 0.5*(NORM(v)+NORM(eta))
+    END IF
+    Es(ii,ismp+1) =~+Ek; Mms(ii,ismp+1) =~+(IF ix=0 THEN 1 ELSE 2) 
+    Kines(ismp+1) =~+Ek; Enses(ismp+1)  =~+(k*k)*Ek
+   FOR ix = ismp TO N BY nsmp AND ALL iy, iz EXCEPT ix=0 AND iy=0 AND iz=0
+  REPEAT
+  DO
+    DO E(n) = ~+Es(n,is); Mm(n) =~+Mms(n,is) FOR ALL n
+    Ense = ~+Enses(is); Kine =~+Kines(is)
+  FOR is=1 TO nsmp
+  DO E(n) = ~*{(4*PI/3)*[(n+0.5)**3 - (n-0.5)**3]/Mm(n)} FOR ALL n 
+ END buildspectra
+
+#else
+
+ SUBROUTINE buildspectra()
+  INTEGER ii, k2p; REAL k, Ek; 
+  Mm=0; E=0; Kine=0; Ense=0
+  DO WITH VV(ix,iy,iz):
+   k2p = ix*ix + iz*iz; k = SQRT(ix*ix + iy*iy + iz*iz); ii = ROUND(k);
+   IF k2p > 0 THEN 
+    Ek = 0.5*(IF ix= 0 THEN 1 ELSE 2)*((k**2)*NORM(v)+NORM(eta))/k2p
+   ELSE
+    Ek = 0.5*(NORM(v)+NORM(eta))
+   END IF
+   E(ii) =~+Ek; Mm(ii) =~+(IF ix=0 THEN 1 ELSE 2) 
+   Kine = ~+Ek; Ense = ~+(k**2)*Ek;
+  FOR ALL ix, iy, iz EXCEPT ix=0 AND iy=0 AND iz=0 
+  DO E(n) = ~*{(4*PI/3)*[(n+0.5)**3 - (n-0.5)**3]/Mm(n)} FOR ALL n
+ END buildspectra
+
+#endif
+
+SUBROUTINE buildkinef()
+  INTEGER k2p; REAL k; Kinef=0 
+  DO WITH VV(ix,iy,iz):
+   k2p = ix*ix + iz*iz; k = SQRT(ix*ix + iy*iy + iz*iz)
+   IF k <= kf THEN
+    IF k2p > 0 THEN 
+      Kinef =~+ 0.5*(IF ix= 0 THEN 1 ELSE 2)*((k**2)*NORM(v)+NORM(eta))/k2p
+    ELSE
+      Kinef =~+ 0.5*(NORM(v)+NORM(eta))
+    END IF
+   END IF
+  FOR ix = 0 TO kf AND iy=-kf TO kf AND iz=-kf TO kf EXCEPT ix=0 AND iy=0 AND iz=0 
+END buildkinef
+
+!------------------------------------------------------------------------------!
+!--------- -------------- Correlations ----------------------------------------!
+
+! Spatial correlations --------------------------------------------------------!
+
+SUBROUTINE update_iso_corr(POINTER TO ARRAY(*,*,*) OF T_CORR VVms)
+ PARALLEL LOOP FOR ismp = 0 TO nsmp-1
+  DO WITH VV(ix,iy,iz), VVms(ix,iy,iz): 
+   etaeta = (~*Nms + NORM(eta))/(Nms+1)
+   vv = (~*Nms + NORM(v))/(Nms+1)
+   veta = (~*Nms + v*CONJG(eta))/(Nms+1)
+   etav = (~*Nms + eta*CONJG(v))/(Nms+1)
+  FOR ix = ismp TO N BY nsmp AND ALL iy, iz
+ REPEAT 
+ Nms =~+1;
+END update_iso_corr
+
+SUBROUTINE save_iso_corr(POINTER TO ARRAY(*,*,*) OF T_CORR VVms; \
+                      STRING corr_saved; STRING corr_log)
+ FILE filecorr = CREATE(corr_saved); FILE logfile = CREATE(corr_log)
+ WRITE BINARY TO filecorr VVms; CLOSE filecorr
+ WRITE TO logfile 'Nms=', Nms; CLOSE logfile
+END save_iso_corr
+
+SUBROUTINE read_iso_corr(POINTER TO ARRAY(*,*,*) OF T_CORR VVms; \
+                     STRING corr_saved; STRING corr_log)
+ FILE filecorr = OPEN(corr_saved); FILE logfile = OPEN(corr_log)
+ READ BINARY FROM filecorr VVms; CLOSE filecorr
+ READ BY NAME FROM logfile Nms; CLOSE logfile
+END read_iso_corr
+
+!------------------------------------------------------------------------------!
+!-------------------- Loading & saving sol/rhs/stat ---------------------------!
+
+#ifdef runtime_stat
+
+ SUBROUTINE update_kineps()  
+  Kinem = (Kinem*Nm + Kine)/(Nm+1)
+  Ensem = (Ensem*Nm + Ense)/(Nm+1)
+  DO Em(n) = (Em(n)*Nm + E(n))/(Nm+1) FOR ALL n
+  Nm =~+1  
+ END update_kineps
+
+ SUBROUTINE savemkineps()
+  WRITE TO kineps Nm, Kinem, Ensem, 2*ni*Ensem, CFL; FLUSH kineps 
+  WRITE TO spectra Nm, Em; FLUSH spectra  
+ END savemkineps
+
+ SUBROUTINE readmkineps()
+  REAL tmp1, tmp2
+  FILE kinfile = OPEN(kineps_old)
+  FILE spectrafile = OPEN(spectra_old)
+  LOOP WHILE READ FROM kinfile Nm, Kinem, Ensem, tmp1, tmp2 REPEAT
+  LOOP WHILE READ FROM spectrafile tmp1, Em REPEAT
+  CLOSE kinfile
+  CLOSE spectrafile
+ END readmkineps
+
+#else
+
+ SUBROUTINE savekineps(REAL time) 
+  WRITE TO kineps time, Kine, Ense, 2*ni*Ense, CFL; FLUSH kineps 
+  WRITE TO spectra time, E; FLUSH spectra  
+ END savekineps
+
+#endif
+
+SUBROUTINE savesol(STRING sol_saved; STRING rhs_saved)
+ FILE solfile = CREATE(sol_saved); WRITE BINARY TO solfile VV; CLOSE solfile 
+ IF memlevels > 1 THEN
+  FILE rhsfile = CREATE(rhs_saved); WRITE BINARY TO rhsfile RHS; CLOSE rhsfile
+ END IF 
+END savesol
+
+SUBROUTINE readsol(STRING sol_saved; STRING rhs_saved)
+ FILE solfile = OPEN(sol_saved); READ BINARY FROM solfile VV; CLOSE solfile; 
+ IF memlevels > 1 THEN
+  FILE rhsfile = OPEN(rhs_saved); READ BINARY FROM rhsfile RHS; CLOSE rhsfile
+ END IF
+END readsol
+
+!------------------------------------------------------------------------------!
+!---------------------- Ode schemes library -----------------------------------!
+
+SUBROUTINE set_AB3IF_coeff()
+ Ac=0; Bc=0; Cc=0; Cc(1) = 23/12; Cc(2) = -16/12; Cc(3) = 5/12
+END set_AB3IF_coeff
+
+SUBROUTINE AB3IF(COMPLEX sol^, old^(*), expl, unkn; INTEGER lv) 
+ sol = EXP(unkn*dt)*~ + dt*(Cc(1)*EXP(unkn*dt)*expl + \
+       Cc(2)*old(1)*EXP(unkn*2*dt) + Cc(3)*old(2)*EXP(unkn*3*dt))
+ old(2) = old(1); old(1) = expl
+END AB3IF
+
+!------------------------------------------------------------------------------!
+
+SUBROUTINE set_CN_RK3_coeff()
+ Ac(1) = 1/3; Ac(2) = 3/4-1/3; Ac(3) = 1-3/4
+ Bc(1) = 0; Bc(2) = -5/9; Bc(3) = -153/128; 
+ Cc(1) = 1/3; Cc(2) = 15/16; Cc(3) = 8/15;
+END set_CN_RK3_coeff
+
+SUBROUTINE set_CN_RK4_coeff()
+ Ac(1) = 0.1496590219993; Ac(2) = 0.3704009573644 -0.1496590219993 
+ Ac(3) = 0.6222557631345 -0.3704009573644; 
+ Ac(4) = 0.9582821306748-0.6222557631345 ; Ac(5)=1-0.9582821306748
+ Bc(1) = 0; Bc(2) = -0.4178904745; Bc(3) = -1.192151694643 
+ Bc(4) = -1.697784692471; Bc(5) = -1.514183444257 
+ Cc(1) = 0.1496590219993; Cc(2) = 0.3792103129999; Cc(3) = 0.8229550293869
+ Cc(4) = 0.6994504559488; Cc(5) = 0.1530572479681
+END set_CN_RK4_coeff
+
+SUBROUTINE CN_RK(COMPLEX sol^, old^(*), expl, unkn; INTEGER lv)
+ old(1) = expl + old(1)*Bc(lv)
+ sol = (1/(1-0.5*dt*(Ac(lv))*unkn))*(~ + Cc(lv)*dt*old(1) + \
+ 0.5*dt*(Ac(lv))*unkn*~)
+END CN_RK
+
+!------------------------------------------------------------------------------!
+!------------------ Advancing time subroutine ---------------------------------!
+
+! NOTE: Hermitian simmetry of the velocity field forced
+
+! NOTE: u(0,iy,0) --> eta(0,iy,0) e w(0,iy,0) --> v(0,iy,0)
+
+SUBROUTINE timestep[SUBROUTINE(COMPLEX sol^, old^(*), expl, unkn; INTEGER lv) \ 
+                    timescheme; INTEGER timelevels]
+REAL k2, qf=0; COMPLEX visc=0, e_expl=0, v_expl=0, hu=0, hv=0, hw=0                                  
+LOOP FOR it = 1 TO timelevels
+ buildvelocity(); convolutions()
+ #ifndef unforced
+  buildkinef()
+ #endif
+ PARALLEL LOOP FOR ismp=0 TO nsmp-1
+  DO WITH VV(ix,iy,iz), F(imdis(ix),imdis(iy),imdis(iz)):  
+   k2 = ix*ix +iy*iy +iz*iz
+   #ifndef unforced 
+    qf = P*(IF (SQRT(k2))<=kf THEN 1 ELSE 0)/(2*Kinef)
+   #endif
+   #ifndef inviscid
+    visc = -ni*k2;
+   #endif 
+   hu = I*ix*uu + I*iy*uv + I*iz*uw
+   hv = I*ix*uv + I*iy*vv + I*iz*vw; hw = I*ix*uw + I*iy*vw + I*iz*ww
+   e_expl = I*ix*hw - I*iz*hu + qf*eta
+   v_expl = (1/k2)*(iy*iz*hw + ix*iy*hu -(ix*ix + iz*iz)*hv) + qf*v
+   #ifdef volume_force
+    e_expl=~+BB(ix,iy,iz).beta; v_expl=~+BB(ix,iy,iz).bv
+   #endif
+   timescheme(eta,RHS(*,ix,iy,iz).rhseta,e_expl,visc,it)
+   timescheme(v,RHS(*,ix,iy,iz).rhsv,v_expl,visc,it)
+  FOR ix = ismp+1 TO N BY nsmp AND iy = -N TO N AND iz = -N TO N
+  DO WITH VV(0,iy,iz), F(0,imdis(iy),iz):
+   k2 = iy*iy +iz*iz
+   #ifndef unforced 
+    qf = P*(IF (SQRT(k2)) <= kf THEN 1 ELSE 0)/(2*Kinef)
+   #endif
+   #ifndef inviscid
+    visc = -ni*k2;
+   #endif 
+   hu = I*iy*uv + I*iz*uw; hv = I*iy*vv + I*iz*vw; 
+   hw = I*iy*vw + I*iz*ww; e_expl = - I*iz*hu + qf*eta
+   v_expl = (1/k2)*(iy*iz*hw -(iz*iz)*hv) + qf*v
+   #ifdef volume_force
+    e_expl=~+BB(0,iy,iz).beta; v_expl=~+BB(0,iy,iz).bv
+   #endif
+   timescheme(eta,RHS(*,0,iy,iz).rhseta,e_expl,visc,it)
+   timescheme(v,RHS(*,0,iy,iz).rhsv,v_expl,visc,it)
+   VV(0,-iy,-iz).v = CONJG(v); VV(0,-iy,-iz).eta = CONJG(eta)  
+  FOR iz= ismp+1 TO N BY nsmp AND iy=-N TO N
+  DO WITH VV(0,iy,0), F(0,iy,0):
+   #ifndef unforced 
+    qf = P*(IF iy <= kf THEN 1 ELSE 0)/(2*Kinef)
+   #endif
+   #ifndef inviscid
+    visc = -ni*iy*iy;
+   #endif 
+   e_expl = -I*iy*uv + qf*eta
+   v_expl = -I*iy*vw + qf*v
+   #ifdef volume_force
+    e_expl=~+BB(0,iy,0).beta; v_expl=~+BB(0,iy,0).bv
+   #endif
+   timescheme(eta,RHS(*,0,iy,0).rhseta,e_expl,visc,it)
+   timescheme(v,RHS(*,0,iy,0).rhsv,v_expl,visc,it)
+   VV(0,-iy,0).v = CONJG(v); VV(0,-iy,0).eta = CONJG(eta)
+  FOR iy = ismp+1 TO N BY nsmp
+ REPEAT
+REPEAT
+END timestep
+
+!------------------------------------------------------------------------------!
+!----------------------- AB startup subroutine --------------------------------! 
+
+SUBROUTINE initAB[SUBROUTINE(COMPLEX sol^, old^(*), expl, unkn; INTEGER lv) \
+                    timescheme; INTEGER timelevels; SUBROUTINE(INTEGER s) \
+                    ext_interface]
+REAL k2,qf=0; COMPLEX hu=0, hv=0, hw=0;
+SHARED ARRAY(0..N,-N..N,-N..N) OF T_RHS RHS_temp=0
+LOOP FOR i = memlevels DOWN TO 0  
+ IF i < memlevels THEN 
+   timestep(timescheme,timelevels)
+   DO WITH RHS(i+1,ix,iy,iz): 
+    rhseta=RHS_temp(ix,iy,iz).rhseta;rhsv=RHS_temp(ix,iy,iz).rhsv
+   FOR ALL ix,iy,iz
+ END IF
+ IF i > 0 THEN
+  buildvelocity(); convolutions(); ext_interface(i)
+  #ifndef unforced
+   buildkinef()
+  #endif
+  PARALLEL LOOP FOR ismp=0 TO nsmp-1
+   DO WITH VV(ix,iy,iz), F(imdis(ix),imdis(iy),imdis(iz)), RHS_temp(ix,iy,iz):  
+    k2 = ix*ix +iy*iy +iz*iz
+    #ifndef unforced 
+     qf = P*(IF (SQRT(k2))<=kf THEN 1 ELSE 0)/(2*Kinef)
+    #endif
+    hu = I*ix*uu + I*iy*uv + I*iz*uw; hv = I*ix*uv + I*iy*vv + I*iz*vw
+    hw = I*ix*uw + I*iy*vw + I*iz*ww; rhseta = I*ix*hw - I*iz*hu + qf*eta
+    rhsv = (1/k2)*(iy*iz*hw + ix*iy*hu -(ix*ix + iz*iz)*hv) + qf*v
+    #ifdef volume_force
+     rhseta=~+BB(ix,iy,iz).beta; rhsv=~+BB(ix,iy,iz).bv
+    #endif
+   FOR ix = ismp+1 TO N BY nsmp AND iy = -N TO N AND iz = -N TO N 
+   DO WITH VV(0,iy,iz), F(0,imdis(iy),iz), RHS_temp(0,iy,iz):
+    k2 = iy*iy +iz*iz
+    #ifndef unforced
+     qf = P*(IF (SQRT(k2)) <= kf THEN 1 ELSE 0)/(2*Kinef)
+    #endif
+    hu = I*iy*uv + I*iz*uw; hv = I*iy*vv + I*iz*vw; hw = I*iy*vw + I*iz*ww
+    rhseta = - I*iz*hu + qf*eta
+    rhsv = (1/k2)*(iy*iz*hw -(iz**2)*hv) + qf*v
+    #ifdef volume_force
+     rhseta=~+BB(0,iy,iz).beta; rhsv=~+BB(0,iy,iz).bv
+    #endif
+   FOR iz= ismp+1 TO N BY nsmp AND iy=-N TO N
+   DO WITH VV(0,iy,0), F(0,iy,0), RHS_temp(0,iy,0):
+    #ifndef unforced
+     qf = P*(IF iy <= kf THEN 1 ELSE 0)/(2*Kinef)
+    #endif
+    rhseta = -I*iy*uv + qf*eta; rhsv = -I*iy*vw + qf*v
+    #ifdef volume_force
+     rhseta=~+BB(0,iy,0).beta; rhsv=~+BB(0,iy,0).bv
+    #endif
+   FOR iy = ismp+1 TO N BY nsmp
+  REPEAT 
+ END IF  
+REPEAT LOOP
+END initAB
+
+!==============================================================================!

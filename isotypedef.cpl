@@ -1,0 +1,24 @@
+!=============================================================================!
+!                               ISOTYPEDEF                                    !
+!                            ----------------                                 !
+!                                                                             !
+!     Direct Numerical Simulation of Homogeneous Isotropic Turbulence         !
+!                                                                             !
+!                   ** Compound type definitions **                           ! 
+!                                                                             !                                                                             !
+!-----------------------------------------------------------------------------!
+!                                                                             !
+! Author      : M. Carini (DIA-PoliMI)                                        !
+! Date        : April 2009                                                    !
+! CPL version : October 2009                                                  ! 
+!                                                                             !
+!=============================================================================!
+
+T_VEL_VORT = STRUCTURE(COMPLEX eta, v)
+T_RHS      = STRUCTURE(COMPLEX rhseta, rhsv)
+T_B        = STRUCTURE(COMPLEX beta, bv)
+T_FLUX     = STRUCTURE(COMPLEX uu, vv, ww, uv, uw, vw)
+T_CORR     = STRUCTURE(COMPLEX vv, veta, etav, etaeta)
+T_CORR_P   = STRUCTURE(COMPLEX ru, rv, rw)
+
+!=============================================================================!

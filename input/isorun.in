@@ -1,0 +1,15 @@
+nsteps=250
+t0=0.0
+dt=0.001
+nsteps_save=10
+nsteps_cfl=1
+restart=TRUE
+sol_old=./sol_saved.bin
+rhs_old=
+isosavepath=./
+restart_stat=FALSE
+kineps_old=
+spectra_old=
+restart_corr=FALSE
+corr_old=
+corrlog_old=

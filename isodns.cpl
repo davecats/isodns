@@ -1,0 +1,255 @@
+!==============================================================================!
+!                                ISODNS                                        !
+!                            --------------                                    !
+!                                                                              !
+!     Direct Numerical Simulation of Homogeneous Isotropic Turbulence          !
+!                                                                              !
+!                    ** Main program for DNS run **                            ! 
+!                                                                              !
+!  Program features:                                                           !
+! -------------------                                                          !
+!                                                                              !
+!    - Very Efficient velocity-vorticity formulation                           !
+!                                                                              !
+!    - Optional solenoidal volume force                                        !
+!                                                                              !
+!    - SMP (Simmetric Multi-Processing) parallel implementation                !
+!                                                                              !
+!    - Low storage mixed RK3/4 - CN ode schemes                                !
+!                                                                              !
+!------------------------------------------------------------------------------!
+!                                                                              !
+! Author      : M. Carini (DIA-PoliMI) and D. Gatti (KIT)                      !
+! Date        : March 2015                                                     !
+! CPL version : October 2009                                                   ! 
+!                                                                              !
+!==============================================================================!
+
+!USE rtchecks
+USE isodnsdata
+
+!------------------------------------------------------------------------------!
+!------------------------ Macros's definitions --------------------------------!
+
+#define correlations
+!#define startup_AB
+#define corr_msg
+#define save_msg
+#define cfl_msg
+!#define save_all_sol_mode
+!#define save_all_corr_mode
+!#define no_iter_msg 
+
+
+!------------------------------------------------------------------------------!
+!---------------------------- Run setup ---------------------------------------!
+
+i0 = memlevels
+
+#ifdef correlations
+ ARRAY(0..N,-N..N,-N..N) OF T_CORR  VVms=0
+#endif
+
+FILE runfile = OPEN('input/isorun.in')
+READ BY NAME FROM runfile nsteps, t0, dt, nsteps_save, nsteps_cfl, restart, \
+                  sol_old, rhs_old, isosavepath
+
+#ifdef runtime_stat 
+READ BY NAME FROM runfile restart_stat, kineps_old, spectra_old
+#endif
+
+#ifdef correlations
+READ BY NAME FROM runfile restart_corr, corr_old, corrlog_old
+#endif
+
+CLOSE runfile
+
+STRING outfile1,outfile2
+
+!------------------------- Print echo run setup ------------------------------!
+
+WRITE '===================================================='
+WRITE '                      ISODNS                        '
+WRITE '                     --------                       '
+WRITE '            Direct Numerical Simulation             '
+WRITE '        of Homogeneous Isotropic Turbulence         '
+WRITE '----------------------------------------------------'
+WRITE ''
+WRITE ' Echo of isodnsdata.in :'                                
+WRITE ''
+WRITE '  - Dealiased Fourirer modes (-N..N)       N = ',N
+WRITE '  - Aliased Fourier modes (0..M-1)         M = ',M
+WRITE '  - Forcing scales (1..kf)             kf/k0 = ',kf
+WRITE '  - Kolmogorov scale                   kd/k0 = ',kd
+WRITE '  - Energy injection rate                 P  = ',P      
+WRITE ''
+WRITE '----------------------------------------------------'
+WRITE ''
+WRITE ' Echo of isorun.in :'
+WRITE ''
+WRITE '  - Number of time steps          nsteps = ',nsteps
+WRITE '  - Time step size                    dt = ',dt
+WRITE '  - update CFL every nsteps   nsteps_cfl = ',nsteps_cfl
+WRITE '  - Save every nsteps        nsteps_save = ',nsteps_save
+WRITE '  - Save directory: ',isosavepath 
+
+IF restart THEN
+
+ WRITE '  - Restart time      t0 = ',t0
+ WRITE '  - Restart from solution: ',sol_old
+
+ IF memlevels > 1 THEN
+  WRITE '  - Restart from rhs: ',rhs_old  
+ END IF
+
+ #ifdef correlations
+  IF restart_corr THEN
+   WRITE '  - Correlations restart files: ',corr_old
+   WRITE '                                ',corrlog_old  
+  END IF
+ #endif
+
+ #ifdef runtime_stat
+  IF restart_stat THEN
+   WRITE '  - Runtime statistics restart files: ',kineps_old
+   WRITE '                                      ',spectra_old  
+  END IF
+ #endif
+
+ELSE
+
+ WRITE '  - Generation of the initial field (Rogallo) ' 
+
+END IF
+
+WRITE ''
+WRITE '===================================================='   
+   
+!------------------------------------------------------------------------------!
+
+spectra = CREATE(WRITE(isosavepath'spectra'nsteps*dt+t0'-kf'kf'.dat')) 
+kineps = CREATE(WRITE(isosavepath'kineps'nsteps*dt+t0'-kf'kf'.dat'))
+
+save_count = nsteps_save; cfl_count = nsteps_cfl
+
+!------------------------------------------------------------------------------!
+
+SUBROUTINE interface(INTEGER dummy)
+ IF memlevels-dummy = cfl_count THEN 
+  getcfl; cfl_count = ~+nsteps_cfl
+  #ifdef cfl_msg
+   WRITE '------------------------' 
+   WRITE 'CFL =', CFL
+   WRITE '------------------------'
+  #endif
+ END IF
+ #ifdef runtime_stat
+  update_kineps()
+ #else
+  savekineps((memlevels-dummy)*dt)
+ #endif
+ #ifdef correlations
+  update_iso_corr(VVms)
+ #endif
+END interface
+
+!------------------------------------------------------------------------------!
+!-------------------- setup initial field and data ----------------------------!
+
+IF restart THEN
+ readsol(sol_old,rhs_old)
+ #ifdef correlations
+  IF restart_corr THEN
+   read_iso_corr(VVms,corr_old,corrlog_old)
+  END IF
+ #endif
+ #ifdef startup_AB
+  set_CN_RK3_coeff; initAB(CN_RK,3,interface); i0 = memlevels +1
+ #endif
+ #ifdef runtime_stat
+  IF restart_stat THEN
+   readmkineps()
+  END IF
+ #endif
+ELSE
+ initRogallo(E0Pope)
+ #ifdef startup_AB
+  set_CN_RK3_coeff; initAB(CN_RK,3,interface); i0 = memlevels +1
+ #endif
+END IF
+
+set_CN_RK3_coeff
+!set_AB3IF_coeff()
+
+!------------------------------------------------------------------------------!
+!------------------------- ode integration ------------------------------------!
+
+LOOP timeloop FOR i = i0 TO nsteps
+ #ifndef no_iter_msg
+  WRITE 'Time step n',i,'of',nsteps
+ #endif
+ timestep(CN_RK,3)
+ !timestep(AB3IF,1)
+ #ifdef correlations
+  update_iso_corr(VVms)
+ #endif
+ IF i = cfl_count THEN 
+  getcfl; cfl_count = ~+nsteps_cfl
+  #ifdef cfl_msg
+   WRITE '------------------------' 
+   WRITE 'CFL =', CFL
+   WRITE '------------------------'
+  #endif
+ END IF
+ buildspectra
+ #ifdef runtime_stat
+  update_kineps()
+ #else
+  savekineps(i*dt+t0)
+ #endif
+ IF i = save_count THEN
+  #ifdef runtime_stat
+   savemkineps()
+  #endif
+  #ifdef save_all_sol_mode 
+   outfile1=''isosavepath'sol'save_count*dt+t0'.bin'
+   outfile2=''isosavepath'sol'save_count*dt+t0'.bin'
+   savesol(outfile1,outfile2)
+  #else
+   outfile1=''isosavepath'sol_saved.bin'
+   outfile2=''isosavepath'rhs_saved.bin'
+   savesol(outfile1,outfile2)
+   outfile1=''isosavepath'sol_saved_copy.bin'
+   outfile2=''isosavepath'rhs_saved_copy.bin'
+   savesol(outfile1,outfile2)
+  #endif
+  #ifdef correlations
+   #ifdef save_all_corr_mode
+    outfile1=''isosavepath'corr'save_count*dt+t0'.bin'
+    outfile2=''isosavepath'corr'save_count*dt+t0'.log'
+    save_iso_corr(VVms,outfile1,outfile2)
+   #else
+    outfile1=''isosavepath'corr_saved.bin'
+    outfile2=''isosavepath'log_corr.txt'
+    save_iso_corr(VVms,outfile1,outfile2)
+    outfile1=''isosavepath'corr_saved_copy.bin' 
+    outfile2=''isosavepath'log_corr_copy.txt'
+    save_iso_corr(VVms,outfile1,outfile2)
+   #endif
+   #ifdef corr_msg
+    WRITE '-------------------'
+    WRITE 'Correlations saved '
+    WRITE '-------------------'
+   #endif
+  #endif
+  save_count =~+nsteps_save
+  #ifdef save_msg
+   WRITE '-------------------------------' 
+   WRITE 'Solution saved to binary files '
+   WRITE '-------------------------------'  
+  #endif
+ END IF
+REPEAT timeloop
+CLOSE kineps; CLOSE spectra
+
+!==============================================================================!
